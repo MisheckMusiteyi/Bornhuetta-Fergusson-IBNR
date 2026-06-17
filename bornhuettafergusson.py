@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Bornhuetter-Ferguson IBNR Calculator
+With per-group A-priori Loss Ratio
 """
 
 import streamlit as st
@@ -104,6 +105,7 @@ st.markdown("""
     .data-check-container { background-color: #E3F2FD; border: 2px solid #2196F3; border-radius: 10px; padding: 1rem; margin-bottom: 1rem; }
     .data-check-warning { background-color: #FFF3E0; border: 2px solid #FF9800; border-radius: 10px; padding: 1rem; margin-bottom: 1rem; }
     .data-check-error { background-color: #FFEBEE; border: 2px solid #F44336; border-radius: 10px; padding: 1rem; margin-bottom: 1rem; }
+    .elr-table-container { background-color: #F9F9F9; border: 2px solid #D4AF37; border-radius: 10px; padding: 1.5rem; margin: 1rem 0; }
     .stSelectbox div[data-baseweb="select"] { width: 100%; }
 </style>
 """, unsafe_allow_html=True)
@@ -291,7 +293,7 @@ st.markdown("""
 st.markdown("""
 <div class="hero">
     <h1>Bornhuetter-Ferguson IBNR Calculator</h1>
-    <p>Upload claims data and premium data. Set the a-priori loss ratio and calculate IBNR using the Bornhuetter-Ferguson method.</p>
+    <p>Upload claims and premium data. Set a-priori loss ratios per group and calculate IBNR using the Bornhuetter-Ferguson method.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -337,25 +339,6 @@ st.markdown("""
 grain_map = {'Yearly': 'Y', 'Quarterly': 'Q', 'Monthly': 'M'}
 grain_label = st.selectbox("Select Grain:", options=list(grain_map.keys()), index=0)
 grain = grain_map[grain_label]
-
-# ELR Input
-st.markdown("""
-<div class="elr-container">
-    <h3>A-priori Loss Ratio (ELR)</h3>
-    <p>Expected loss ratio as a percentage</p>
-</div>
-""", unsafe_allow_html=True)
-
-elr_input = st.number_input(
-    "Expected Loss Ratio (%)",
-    min_value=0.0,
-    max_value=200.0,
-    value=70.0,
-    step=1.0,
-    label_visibility="collapsed"
-) / 100
-
-st.caption(f"A-priori Loss Ratio: **{elr_input*100:.1f}%**")
 
 # Claims File Upload
 st.markdown("""
@@ -436,19 +419,19 @@ if claims_file is not None:
 
         st.markdown("---")
 
-        # Grouping Columns
+        # Grouping Column
         st.markdown("""
         <div class="grouping-container">
-            <h3>Grouping Columns</h3>
-            <p>Select columns to group by (e.g., Line_of_Business)</p>
+            <h3>Aggregation Column</h3>
+            <p>Select the column to group by (e.g., Line_of_Business). ELR will be set per unique group.</p>
         </div>
         """, unsafe_allow_html=True)
         
         group_options = [c for c in all_cols if c not in [loss_col, report_col]]
-        index_cols = st.multiselect("Select grouping columns:", options=group_options)
+        aggregation_col = st.selectbox("Select aggregation column:", options=[""] + group_options)
         
-        if not index_cols:
-            st.error("Please select at least one grouping column.")
+        if not aggregation_col:
+            st.error("Please select an aggregation column.")
             st.stop()
 
         st.markdown("---")
@@ -456,7 +439,7 @@ if claims_file is not None:
         # Numeric Columns
         st.markdown("### Select Numeric Columns (Claim Amounts)")
         
-        num_options = [c for c in all_cols if c not in [loss_col, report_col] + index_cols]
+        num_options = [c for c in all_cols if c not in [loss_col, report_col, aggregation_col]]
         
         if not num_options:
             st.error("No numeric columns found.")
@@ -468,8 +451,8 @@ if claims_file is not None:
             st.error("Please select at least one claim amount column.")
             st.stop()
 
-        st.write(f"Selected grouping columns: **{', '.join(index_cols)}**")
-        st.write(f"Selected claim amount columns: **{', '.join(value_cols)}**")
+        st.write(f"Aggregation column: **{aggregation_col}**")
+        st.write(f"Claim amount columns: **{', '.join(value_cols)}**")
 
         # --- PROCESS DATA ---
         df[loss_col] = pd.to_datetime(df[loss_col], errors='coerce')
@@ -486,9 +469,9 @@ if claims_file is not None:
         # --- DATA QUALITY CHECKS ---
         st.markdown("### Data Quality Checks")
         
-        # Check missing values in required columns
+        # Check missing values
         missing = []
-        for col in [loss_col, report_col] + index_cols + value_cols:
+        for col in [loss_col, report_col, aggregation_col] + value_cols:
             cnt = df_filtered[col].isna().sum()
             if cnt > 0:
                 missing.append(f"{col} ({cnt})")
@@ -509,7 +492,7 @@ if claims_file is not None:
             df_filtered = df_filtered.drop_duplicates()
             st.markdown(f'<div class="data-check-warning">⚠️ Removed {dup_count} duplicate rows</div>', unsafe_allow_html=True)
         
-        # Clean numeric columns (handle currency symbols, commas, etc.)
+        # Clean numeric columns
         for col in value_cols:
             if df_filtered[col].dtype == 'object':
                 cleaned = df_filtered[col].astype(str).str.replace(r'[$,€£]', '', regex=True)
@@ -522,10 +505,59 @@ if claims_file is not None:
         st.markdown("---")
 
         # ====================================================================
+        # GET UNIQUE GROUPS AND SET ELR PER GROUP
+        # ====================================================================
+        
+        unique_groups = sorted(df_filtered[aggregation_col].unique())
+        
+        st.markdown("""
+        <div class="elr-container">
+            <h3>A-priori Loss Ratio (ELR) per Group</h3>
+            <p>Set the expected loss ratio for each unique group in the aggregation column</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown('<div class="elr-table-container">', unsafe_allow_html=True)
+        
+        # Create ELR input for each unique group
+        elr_dict = {}
+        
+        # Display as a nice table layout
+        cols_per_row = 4
+        for i in range(0, len(unique_groups), cols_per_row):
+            cols = st.columns(cols_per_row)
+            for j in range(cols_per_row):
+                idx = i + j
+                if idx < len(unique_groups):
+                    group_name = unique_groups[idx]
+                    with cols[j]:
+                        st.markdown(f"**{group_name}**")
+                        elr_val = st.number_input(
+                            f"ELR %",
+                            min_value=0.0,
+                            max_value=200.0,
+                            value=70.0,
+                            step=1.0,
+                            key=f"elr_{group_name}",
+                            label_visibility="collapsed"
+                        )
+                        elr_dict[group_name] = elr_val / 100
+                        st.caption(f"{elr_val:.0f}%")
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        # Show ELR summary
+        st.write("### ELR Summary")
+        elr_summary_df = pd.DataFrame({
+            aggregation_col: list(elr_dict.keys()),
+            'ELR': [f"{v*100:.1f}%" for v in elr_dict.values()]
+        })
+        st.dataframe(elr_summary_df, use_container_width=True)
+
+        # ====================================================================
         # CALCULATE TRIANGLE PARAMETERS
         # ====================================================================
         
-        # Calculate number of development periods based on date range
         if grain == 'M':
             total_months = (to_date.year - from_date.year) * 12 + (to_date.month - from_date.month)
             n_dev_periods = total_months + 1
@@ -602,7 +634,7 @@ if claims_file is not None:
                 
                 # Validate row count
                 if len(prem_df) != n_accident_periods:
-                    st.markdown(f'<div class="data-check-error">❌ Premium file has {len(prem_df)} rows but {n_accident_periods} accident periods are required. Please ensure your premium file matches the number of accident periods.</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="data-check-error">❌ Premium file has {len(prem_df)} rows but {n_accident_periods} accident periods are required.</div>', unsafe_allow_html=True)
                 else:
                     # Clean premium column if needed
                     if prem_df[premium_amount_col].dtype == 'object':
@@ -624,7 +656,6 @@ if claims_file is not None:
                         
                         premium_data_valid = True
                         st.markdown(f'<div class="data-check-container">✅ Premium data loaded: {len(premiums)} periods, Total Premium: {sum(premiums):,.2f}</div>', unsafe_allow_html=True)
-                        st.markdown(f'**Expected Ultimate Claims (Premium × {elr_input*100:.1f}%): {sum(premiums) * elr_input:,.2f}**')
             
             except Exception as e:
                 st.markdown(f'<div class="data-check-error">❌ Error reading premium file: {e}</div>', unsafe_allow_html=True)
@@ -632,13 +663,10 @@ if claims_file is not None:
             st.info("Please upload a premium file to proceed with BF calculation.")
 
         # ====================================================================
-        # RUN BF CALCULATION
+        # RUN BF CALCULATION FOR EACH GROUP
         # ====================================================================
         
         if premium_data_valid and premiums is not None:
-            # Get group combinations
-            group_combinations = df_filtered[index_cols].drop_duplicates()
-
             all_bf_results = []
             all_incremental_triangles = {}
             all_cumulative_triangles = {}
@@ -647,16 +675,12 @@ if claims_file is not None:
             all_pct_unpaid = {}
 
             with st.spinner("Running Bornhuetter-Ferguson calculation..."):
-                for idx, group_row in group_combinations.iterrows():
-                    group_mask = pd.Series(True, index=df_filtered.index)
-                    group_name_parts = []
+                for group_name in unique_groups:
+                    # Get ELR for this group
+                    group_elr = elr_dict[group_name]
                     
-                    for col in index_cols:
-                        group_mask = group_mask & (df_filtered[col] == group_row[col])
-                        group_name_parts.append(f"{group_row[col]}")
-                    
-                    group_name = " | ".join(group_name_parts)
-                    group_data = df_filtered[group_mask].copy()
+                    # Filter data for this group
+                    group_data = df_filtered[df_filtered[aggregation_col] == group_name].copy()
                     
                     if len(group_data) == 0:
                         continue
@@ -675,8 +699,8 @@ if claims_file is not None:
                         all_incremental_triangles[triangle_key] = inc_triangle
                         all_cumulative_triangles[triangle_key] = cum_triangle
                         
-                        # Run BF
-                        result = calculate_bf_ibnr(cum_triangle, premiums, elr_input, from_date, grain)
+                        # Run BF with group-specific ELR
+                        result = calculate_bf_ibnr(cum_triangle, premiums, group_elr, from_date, grain)
                         
                         all_dev_factors[triangle_key] = result['dev_factors']
                         all_cdfs[triangle_key] = result['cdfs']
@@ -684,8 +708,7 @@ if claims_file is not None:
                         
                         # Add grouping info
                         result_df = result['results_df'].copy()
-                        for col in index_cols:
-                            result_df[col] = group_row[col]
+                        result_df[aggregation_col] = group_name
                         result_df['Amount_Column'] = amount_col
                         
                         all_bf_results.append(result_df)
@@ -700,26 +723,25 @@ if claims_file is not None:
                 combined_results = pd.concat(all_bf_results, ignore_index=True)
                 
                 # Create summary
-                summary_cols = index_cols + ['Amount_Column']
+                summary_cols = [aggregation_col, 'Amount_Column']
                 
                 bf_summary = combined_results.groupby(summary_cols).agg({
                     'Current_Claims': 'sum',
                     'Premium': 'sum',
                     'Expected_Ultimate': 'sum',
                     'BF_IBNR': 'sum',
-                    'BF_Ultimate': 'sum'
+                    'BF_Ultimate': 'sum',
+                    'ELR': 'first'
                 }).reset_index()
                 
                 bf_summary['BF_IBNR_Ratio'] = bf_summary['BF_IBNR'] / bf_summary['BF_Ultimate']
                 bf_summary['BF_IBNR_Ratio'] = bf_summary['BF_IBNR_Ratio'].fillna(0)
-                bf_summary['ELR'] = elr_input
 
-                # Display BF IBNR Summary
+                # Display results header
                 st.markdown('<div class="card">', unsafe_allow_html=True)
                 st.subheader(f"BF IBNR Results for Period: {from_date.date()} to {to_date.date()}")
                 st.markdown(f"**Grain:** {grain_label}")
-                st.markdown(f"**ELR:** {elr_input*100:.1f}%")
-                st.markdown(f"**Grouped by:** {', '.join(index_cols)}")
+                st.markdown(f"**Aggregation:** {aggregation_col}")
                 st.markdown('</div>', unsafe_allow_html=True)
                 
                 # Display summary table
@@ -728,57 +750,59 @@ if claims_file is not None:
                 display_summary = bf_summary.copy()
                 for col in display_summary.columns:
                     if col not in summary_cols:
-                        if 'Ratio' in col or 'ELR' in col:
+                        if 'Ratio' in col:
                             display_summary[col] = display_summary[col].apply(lambda x: f"{x:.2%}" if isinstance(x, (int, float)) else x)
+                        elif 'ELR' in col:
+                            display_summary[col] = display_summary[col].apply(lambda x: f"{x*100:.1f}%" if isinstance(x, (int, float)) else x)
                         else:
                             display_summary[col] = display_summary[col].apply(lambda x: f"{x:,.2f}" if isinstance(x, (int, float)) else x)
                 st.dataframe(display_summary, use_container_width=True)
                 st.markdown('</div>', unsafe_allow_html=True)
                 
                 # Development Factors & CDFs
-                st.markdown('<div class="card">', unsafe_allow_html=True)
-                st.subheader("Development Factors & CDFs")
-                for key in all_dev_factors.keys():
-                    st.write(f"**{key}**")
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.write("Dev Factors:")
-                        st.write([round(x, 4) for x in all_dev_factors[key]])
-                    with col2:
-                        st.write("CDFs to Ultimate:")
-                        st.write([round(x, 4) for x in all_cdfs[key]])
-                    with col3:
-                        st.write("% Unpaid:")
-                        st.write([f"{x*100:.1f}%" for x in all_pct_unpaid[key]])
-                    st.write("---")
-                st.markdown('</div>', unsafe_allow_html=True)
+                with st.expander("📈 Development Factors & CDFs"):
+                    for key in all_dev_factors.keys():
+                        st.write(f"**{key}**")
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.write("Dev Factors:")
+                            st.write([round(x, 4) for x in all_dev_factors[key]])
+                        with col2:
+                            st.write("CDFs to Ultimate:")
+                            st.write([round(x, 4) for x in all_cdfs[key]])
+                        with col3:
+                            st.write("% Unpaid:")
+                            st.write([f"{x*100:.1f}%" for x in all_pct_unpaid[key]])
+                        st.write("---")
                 
                 # Detailed IBNR by Accident Period
-                st.markdown('<div class="card">', unsafe_allow_html=True)
-                st.subheader("BF IBNR by Accident Period (Detailed)")
-                for key in all_incremental_triangles.keys():
-                    st.write(f"**{key}**")
-                    group_val = key.split(' | ')[0]
-                    amount_val = key.split(' | ')[-1]
-                    
-                    detail = combined_results[combined_results['Amount_Column'] == amount_val]
-                    for col in index_cols:
-                        detail = detail[detail[col] == group_val]
-                    
-                    if len(detail) > 0:
-                        display_cols = ['Accident_Period_Label', 'Current_Claims', 'Premium', 
-                                      'Expected_Ultimate', 'Pct_Developed', 'BF_IBNR', 'BF_Ultimate']
-                        display_detail = detail[display_cols].copy()
-                        for col in display_detail.columns:
-                            if col == 'Accident_Period_Label':
-                                continue
-                            elif 'Pct_' in col:
-                                display_detail[col] = display_detail[col].apply(lambda x: f"{x:.1f}%")
-                            else:
-                                display_detail[col] = display_detail[col].apply(lambda x: f"{x:,.2f}")
-                        st.dataframe(display_detail, use_container_width=True)
-                    st.write("---")
-                st.markdown('</div>', unsafe_allow_html=True)
+                with st.expander("📋 Detailed BF IBNR by Accident Period"):
+                    for key in all_incremental_triangles.keys():
+                        st.write(f"**{key}**")
+                        parts = key.split(' | ')
+                        group_val = parts[0]
+                        amount_val = parts[-1]
+                        
+                        detail = combined_results[
+                            (combined_results[aggregation_col] == group_val) &
+                            (combined_results['Amount_Column'] == amount_val)
+                        ]
+                        
+                        if len(detail) > 0:
+                            display_cols = ['Accident_Period_Label', 'Current_Claims', 'Premium', 
+                                          'Expected_Ultimate', 'ELR', 'Pct_Developed', 'BF_IBNR', 'BF_Ultimate']
+                            display_detail = detail[display_cols].copy()
+                            for col in display_detail.columns:
+                                if col == 'Accident_Period_Label':
+                                    continue
+                                elif 'Pct_' in col:
+                                    display_detail[col] = display_detail[col].apply(lambda x: f"{x:.1f}%")
+                                elif 'ELR' in col:
+                                    display_detail[col] = display_detail[col].apply(lambda x: f"{x*100:.1f}%")
+                                else:
+                                    display_detail[col] = display_detail[col].apply(lambda x: f"{x:,.2f}")
+                            st.dataframe(display_detail, use_container_width=True)
+                        st.write("---")
 
                 # ====================================================================
                 # EXPORT TO EXCEL
@@ -791,6 +815,9 @@ if claims_file is not None:
                     
                     # Detailed BF IBNR
                     combined_results.to_excel(writer, index=False, sheet_name='BF_IBNR_Detail')
+                    
+                    # ELR by Group
+                    elr_summary_df.to_excel(writer, index=False, sheet_name='ELR_By_Group')
                     
                     # Incremental Triangles
                     inc_combined = pd.DataFrame()
@@ -844,20 +871,20 @@ if claims_file is not None:
                     # Premiums Used
                     premiums_df = pd.DataFrame({
                         'Accident_Period': range(n_accident_periods),
-                        'Premium': premiums,
-                        'Expected_Ultimate_Claims': [p * elr_input for p in premiums]
+                        'Premium': premiums
                     })
+                    # Add expected ultimate per group
+                    for group_name, group_elr in elr_dict.items():
+                        premiums_df[f'Expected_Ultimate_{group_name}'] = [p * group_elr for p in premiums]
                     premiums_df.to_excel(writer, index=False, sheet_name='Premiums_Used')
                     
                     # Parameters
                     params_df = pd.DataFrame({
                         'Parameter': ['Start Date', 'End Date', 'Grain', 'Dev Periods', 
-                                     'Accident Periods', 'ELR', 'Total Premium', 
-                                     'Grouping Columns', 'Amount Columns'],
+                                     'Accident Periods', 'Aggregation Column', 'Amount Columns'],
                         'Value': [
                             str(from_date.date()), str(to_date.date()), grain_label, n_dev_periods,
-                            n_accident_periods, f'{elr_input*100:.1f}%', f'{sum(premiums):,.2f}',
-                            ', '.join(index_cols), ', '.join(value_cols)
+                            n_accident_periods, aggregation_col, ', '.join(value_cols)
                         ]
                     })
                     params_df.to_excel(writer, index=False, sheet_name='Parameters')
